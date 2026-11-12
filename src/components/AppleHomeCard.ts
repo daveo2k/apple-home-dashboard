@@ -3,8 +3,18 @@ import { SnapshotManager } from '../utils/SnapshotManager';
 import { CardConfig, EntityState } from '../types/types';
 import { localize } from '../utils/LocalizationService';
 import { RTLHelper } from '../utils/RTLHelper';
+import { BrightnessDragController } from '../utils/BrightnessDragController';
+
+/** How long to keep showing the dragged brightness while waiting for HA to confirm it. */
+const DIM_HOLD_MS = 3000;
+/** Tolerance (percentage points) when matching HA's reported brightness to the dragged value. */
+const DIM_MATCH_TOLERANCE = 2;
 
 export class AppleHomeCard extends HTMLElement {
+  private dimController?: BrightnessDragController;
+  /** Optimistic brightness shown while dragging and until HA reports it back. */
+  private dimPct?: number;
+  private dimHoldTimer?: number;
   private config?: CardConfig;
   private _hass?: any;
   private entity?: string;
@@ -96,6 +106,12 @@ export class AppleHomeCard extends HTMLElement {
     // Clear the bound references so connectedCallback knows to re-attach
     this.boundCardClick = undefined;
     this.boundIconClick = undefined;
+
+    // Tear down brightness drag (flushes a pending value) and the optimistic hold
+    this.dimController?.destroy();
+    this.dimController = undefined;
+    this.clearDimHold();
+    this.dimPct = undefined;
     
     // Clean up camera resources
     this.cameraImages.forEach(img => {
@@ -141,6 +157,20 @@ export class AppleHomeCard extends HTMLElement {
     // Update snapshot manager if it exists
     if (this.snapshotManager) {
       this.snapshotManager.setHass(hass);
+    }
+
+    // Drop the optimistic brightness once HA reports the value we set
+    let dimConfirmed = false;
+    if (this.dimPct !== undefined && !this.dimController?.isDragging && this.entity) {
+      const newState = hass.states[this.entity];
+      if (!newState || Math.abs(this.getBrightnessPct(newState) - this.dimPct) <= DIM_MATCH_TOLERANCE) {
+        this.clearDimHold();
+        this.dimPct = undefined;
+        dimConfirmed = true;
+      }
+    }
+    if (dimConfirmed && oldHass && this._hasRendered) {
+      this.updateCardInPlace();
     }
 
     if (!oldHass) {
@@ -195,18 +225,19 @@ export class AppleHomeCard extends HTMLElement {
       return;
     }
     
-    const state = this._hass.states[this.entity];
-    if (!state) {
+    const realState = this._hass.states[this.entity];
+    if (!realState) {
       this.renderErrorState(localize('errors.entity_not_found'));
       return;
     }
-    
+    const state = this.getDisplayState(realState);
+
     const name = this.name || state.attributes.friendly_name || this.entity.split('.')[1].replace(/_/g, ' ');
-    
+
     // Check if we're in a status section context (modal or status chips)
     const isInStatusContext = this.closest('.status-modal-cards') || this.closest('.status-chips-container');
     const forceWhiteIcons = Boolean(isInStatusContext);
-    
+
     const entityData = DashboardConfig.getEntityData(state, this.domain!, this.isTall, forceWhiteIcons, this._hass);
     
     if (!this.shadowRoot) {
@@ -297,6 +328,7 @@ export class AppleHomeCard extends HTMLElement {
         ${this.getCardStyles(entityData, isEditMode)}
       </style>
       <div class="apple-home-card ${isEditMode ? 'edit-mode' : ''} ${this.domain === 'camera' && this.cameraView === 'snapshot' ? 'camera-card' : ''} ${RTLHelper.isRTL() ? 'rtl' : 'ltr'}">
+        ${this.domain === 'light' ? '<div class="brightness-fill"></div>' : ''}
         <div class="card-info">
           ${iconElement}
           ${this.domain === 'camera' && this.cameraView === 'snapshot' ? (() => {
@@ -332,6 +364,7 @@ export class AppleHomeCard extends HTMLElement {
     
     // Apply CSS custom properties for dynamic values
     this.updateCSSVariables(entityData);
+    this.updateBrightnessFill(state);
     this._hasRendered = true;
 
     // Add click handlers only if not in edit mode
@@ -391,11 +424,105 @@ export class AppleHomeCard extends HTMLElement {
         entityData.isActive ? 'rgba(29, 29, 31, 0.6)' : 'rgba(255, 255, 255, 0.6)');
   }
 
+  // ---------------------------------------------------------------------------
+  // Brightness drag (slide across a dimmable light tile)
+  // ---------------------------------------------------------------------------
+
+  /** A light is dimmable if it supports any color mode other than on/off. */
+  private isDimmableLight(state: EntityState | undefined): boolean {
+    if (!state || this.domain !== 'light') return false;
+    if (state.state === 'unavailable' || state.state === 'unknown') return false;
+    const modes: string[] | undefined = state.attributes?.supported_color_modes;
+    if (Array.isArray(modes) && modes.length > 0) {
+      return modes.some((m) => m !== 'onoff');
+    }
+    // Legacy integrations: SUPPORT_BRIGHTNESS = 1, or a brightness attribute present
+    return ((state.attributes?.supported_features ?? 0) & 1) === 1 ||
+      typeof state.attributes?.brightness === 'number';
+  }
+
+  private getBrightnessPct(state: EntityState): number {
+    if (state.state !== 'on') return 0;
+    const b = state.attributes?.brightness;
+    return typeof b === 'number' ? Math.round((b / 255) * 100) : 100;
+  }
+
+  /** The real state, or a copy carrying the optimistic brightness during/after a drag. */
+  private getDisplayState(state: EntityState): EntityState {
+    if (this.dimPct === undefined || this.domain !== 'light') return state;
+    const pct = this.dimPct;
+    return {
+      ...state,
+      state: pct > 0 ? 'on' : 'off',
+      attributes: {
+        ...state.attributes,
+        brightness: pct > 0 ? Math.max(1, Math.round((pct / 100) * 255)) : undefined,
+      },
+    };
+  }
+
+  private updateBrightnessFill(displayState: EntityState) {
+    const card = this.shadowRoot?.querySelector('.apple-home-card') as HTMLElement | null;
+    if (!card) return;
+    const dimmable = this.isDimmableLight(this._hass?.states[this.entity!]);
+    card.classList.toggle('dimmable', dimmable);
+    const pct = dimmable ? this.getBrightnessPct(displayState) : 0;
+    card.classList.toggle('dim-level', dimmable && pct > 0);
+    this.style.setProperty('--brightness-fill', String(pct / 100));
+  }
+
+  private setupBrightnessDrag(card: HTMLElement) {
+    this.dimController?.destroy();
+    this.dimController = undefined;
+    if (this.domain !== 'light') return;
+
+    this.dimController = new BrightnessDragController(card, {
+      canDrag: () => {
+        const isEditMode = this.closest('.entity-card-wrapper')?.classList.contains('edit-mode') ||
+          card.classList.contains('edit-mode');
+        return !isEditMode && !!this._hass && this.isDimmableLight(this._hass.states[this.entity!]);
+      },
+      getCurrentPct: () => {
+        if (this.dimPct !== undefined) return this.dimPct;
+        const state = this._hass?.states[this.entity!];
+        return state ? this.getBrightnessPct(state) : 0;
+      },
+      isRTL: () => card.classList.contains('rtl'),
+      onPreview: (pct) => {
+        this.clearDimHold();
+        this.dimPct = pct;
+        card.classList.add('dim-dragging');
+        this.updateCardInPlace();
+      },
+      onCommit: (pct) => {
+        // brightness_pct: 0 turns the light off (Home Assistant light.turn_on semantics)
+        this._hass?.callService('light', 'turn_on', { entity_id: this.entity, brightness_pct: pct });
+      },
+      onDragEnd: () => {
+        card.classList.remove('dim-dragging');
+        this.clearDimHold();
+        this.dimHoldTimer = window.setTimeout(() => {
+          this.dimHoldTimer = undefined;
+          this.dimPct = undefined;
+          this.updateCardInPlace();
+        }, DIM_HOLD_MS);
+      },
+    });
+  }
+
+  private clearDimHold() {
+    if (this.dimHoldTimer !== undefined) {
+      clearTimeout(this.dimHoldTimer);
+      this.dimHoldTimer = undefined;
+    }
+  }
+
   private updateCardInPlace() {
     if (!this._hass || !this.entity || !this.shadowRoot) return;
 
-    const state = this._hass.states[this.entity];
-    if (!state) return;
+    const realState = this._hass.states[this.entity];
+    if (!realState) return;
+    const state = this.getDisplayState(realState);
 
     const name = this.name || state.attributes.friendly_name || this.entity.split('.')[1].replace(/_/g, ' ');
     const isInStatusContext = this.closest('.status-modal-cards') || this.closest('.status-chips-container');
@@ -404,6 +531,7 @@ export class AppleHomeCard extends HTMLElement {
 
     // Update CSS custom properties - browser handles all visual changes efficiently
     this.updateCSSVariables(entityData);
+    this.updateBrightnessFill(state);
 
     // Update entity name
     const nameEl = this.shadowRoot.querySelector('.entity-name');
@@ -610,6 +738,7 @@ export class AppleHomeCard extends HTMLElement {
     
     if (card) {
       card.addEventListener('click', this.boundCardClick);
+      this.setupBrightnessDrag(card);
     }
     
     if (icon) {
@@ -742,6 +871,50 @@ export class AppleHomeCard extends HTMLElement {
         margin-top: 0;
         display: flex;
         height: 100%;
+      }
+
+      /* Brightness drag: dimmable light tiles */
+      .apple-home-card.dimmable {
+        /* Keep vertical page scrolling native; horizontal moves reach the drag handler */
+        touch-action: pan-y;
+      }
+
+      .apple-home-card.dimmable .card-info {
+        position: relative;
+        z-index: 1;
+      }
+
+      .brightness-fill {
+        position: absolute;
+        inset: 0;
+        z-index: 0;
+        pointer-events: none;
+        background: var(--apple-card-bg-active, #ffffff);
+        transform-origin: left center;
+        transform: scaleX(var(--brightness-fill, 0));
+        opacity: 0;
+        transition: transform 0.25s ease, opacity 0.25s ease;
+      }
+
+      .apple-home-card.rtl .brightness-fill {
+        transform-origin: right center;
+      }
+
+      /* When on, the unfilled part becomes an opaque grey track so the level is
+         visible on both light and dark wallpapers, with dark text still readable */
+      .apple-home-card.dimmable.dim-level {
+        background: #c6c6ca;
+        background: color-mix(in srgb, var(--apple-card-bg-active, #ffffff) 45%, #8e8e93);
+      }
+
+      .apple-home-card.dimmable.dim-level .brightness-fill {
+        opacity: 1;
+      }
+
+      /* Track the finger 1:1 while dragging */
+      .apple-home-card.dim-dragging,
+      .apple-home-card.dim-dragging .brightness-fill {
+        transition: none;
       }
       
       /* Regular Design - Icon and text side by side */
